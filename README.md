@@ -16,7 +16,13 @@ Pass the photo folder as an argument to process it directly:
 python sort.py "C:\Photos"
 ```
 
-Run without an argument to open the graphical interface, or use `python sort.py --help` to display the command-line options.
+Geocoding uses a 20-second timeout by default. Override it with `--timeout`:
+
+```powershell
+python sort.py "C:\Photos" --timeout 45
+```
+
+Run without an argument to open the graphical interface, or use `python sort.py --help` to display the command-line options. The graphical interface also has a geocoding timeout setting.
 
 ### Graphical interface
 

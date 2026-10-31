@@ -7,11 +7,30 @@ import threading
 from typing import Any, Callable, cast
 
 import exifread
+from geopy.extra.rate_limiter import RateLimiter
 from geopy.geocoders import Nominatim
 
 unbekannt = 0
 
 geolocator = Nominatim(user_agent="geo_renamer")
+reverse_geocode = RateLimiter(
+    geolocator.reverse,
+    min_delay_seconds=1,
+    max_retries=2,
+    error_wait_seconds=5,
+    swallow_exceptions=False,
+)
+
+
+def report_geolocation_failure(
+    message: str,
+    warning_callback: Callable[[str], None] | None = None,
+) -> None:
+    if warning_callback:
+        warning_callback(message)
+    else:
+        print(f"Warning: {message}")
+
 
 def sanitize_filename(filename: str, max_length=255) -> str:
     """
@@ -45,7 +64,11 @@ def compute_sha256(file_path):
     return sha256_hash.hexdigest()
 
 
-def get_exif_data(image_path):
+def get_exif_data(
+    image_path,
+    timeout=20,
+    warning_callback: Callable[[str], None] | None = None,
+):
     global unbekannt
 
     with open(image_path, 'rb') as f:
@@ -60,10 +83,21 @@ def get_exif_data(image_path):
         if gps_latitude and gps_longitude:
             lat = convert_to_degrees(gps_latitude)
             lon = convert_to_degrees(gps_longitude)
-            location = get_location(lat, lon)
+
+            def report_failure(reason: str) -> None:
+                filename = os.path.basename(image_path)
+                report_geolocation_failure(
+                    f"{filename}: {reason}", warning_callback
+                )
+
+            location = get_location(lat, lon, timeout, report_failure)
         else:
             unbekannt = unbekannt + 1
             location = f" {unbekannt}"
+            filename = os.path.basename(image_path)
+            report_geolocation_failure(
+                f"{filename}: GPS coordinates are missing.", warning_callback
+            )
 
         return date_taken, location
 
@@ -72,12 +106,17 @@ def convert_to_degrees(value):
     d, m, s = value.values
     return d + (m / 60.0) + (s / 3600.0)
 
-def get_location(lat, lon):
+def get_location(
+    lat,
+    lon,
+    timeout=20,
+    warning_callback: Callable[[str], None] | None = None,
+):
     global unbekannt
 
     """converts GPS coordinates to locations by help of geopy"""
     try:
-        location = geolocator.reverse((lat, lon), exactly_one=True)
+        location = reverse_geocode((lat, lon), exactly_one=True, timeout=timeout)
         if location:
             raw_location = cast(dict[str, Any], cast(Any, location).raw)
             address = raw_location.get("address", {})
@@ -105,14 +144,23 @@ def get_location(lat, lon):
             return ret
         else:
             unbekannt = unbekannt + 1
+            report_geolocation_failure(
+                f"No result for coordinates ({lat}, {lon}).", warning_callback
+            )
             return str(unbekannt)
-    except BaseException as e:
+    except Exception as error:
         unbekannt = unbekannt + 1
+        report_geolocation_failure(
+            f"Lookup failed for coordinates ({lat}, {lon}): {error}",
+            warning_callback,
+        )
         return str(unbekannt)
 
 def rename_images(
     directory: str,
     progress_callback: Callable[[str, int, int], None] | None = None,
+    timeout: int = 20,
+    warning_callback: Callable[[str], None] | None = None,
 ) -> None:
     image_filenames = [
         filename
@@ -132,7 +180,9 @@ def rename_images(
             os.remove(image_path)
         else:
             hashes.add(file_hash)
-            date_taken, location = get_exif_data(image_path)
+            date_taken, location = get_exif_data(
+                image_path, timeout, warning_callback
+            )
             if date_taken:
                 new_filename = sanitize_filename(f"{date_taken} {location}.jpg")
                 new_path = os.path.join(directory, new_filename)
@@ -156,6 +206,10 @@ def run_gui() -> None:
 
     directory_var = tk.StringVar()
     current_file_var = tk.StringVar(value="No file processed")
+    timeout_var = tk.IntVar(value=20)
+    warning_var = tk.StringVar(value="Geolocation issues: 0")
+    location_warning_count = 0
+    latest_location_warning = ""
     events: queue.Queue[tuple[str, str, int, int]] = queue.Queue()
 
     def select_directory() -> None:
@@ -164,14 +218,27 @@ def run_gui() -> None:
             directory_var.set(directory)
 
     def start_conversion() -> None:
+        nonlocal location_warning_count, latest_location_warning
+
         directory = directory_var.get()
         if not os.path.isdir(directory):
             messagebox.showerror("Invalid folder", "Select an existing folder first.")
             return
 
+        try:
+            timeout = timeout_var.get()
+            if timeout < 1:
+                raise ValueError
+        except (tk.TclError, ValueError):
+            messagebox.showerror("Invalid timeout", "Enter at least 1 second.")
+            return
+
         start_button.configure(state="disabled")
         progress.configure(maximum=1, value=0)
         current_file_var.set("Starting...")
+        location_warning_count = 0
+        latest_location_warning = ""
+        warning_var.set("Geolocation issues: 0")
 
         def worker() -> None:
             try:
@@ -180,6 +247,8 @@ def run_gui() -> None:
                     lambda filename, completed, total: events.put(
                         ("progress", filename, completed, total)
                     ),
+                    timeout,
+                    lambda message: events.put(("warning", message, 0, 0)),
                 )
             except Exception as error:
                 events.put(("error", str(error), 0, 0))
@@ -189,18 +258,33 @@ def run_gui() -> None:
         threading.Thread(target=worker, daemon=True).start()
 
     def poll_events() -> None:
+        nonlocal location_warning_count, latest_location_warning
+
         try:
             while True:
                 event, value, completed, total = events.get_nowait()
                 if event == "progress":
                     current_file_var.set(value)
                     progress.configure(maximum=max(total, 1), value=completed)
+                elif event == "warning":
+                    location_warning_count += 1
+                    latest_location_warning = value
+                    warning_var.set(
+                        f"Geolocation issues: {location_warning_count}. Latest: {value}"
+                    )
                 elif event == "error":
                     start_button.configure(state="normal")
                     messagebox.showerror("Conversion failed", value)
                 else:
                     start_button.configure(state="normal")
                     current_file_var.set("Finished")
+                    if location_warning_count:
+                        messagebox.showwarning(
+                            "Geolocation incomplete",
+                            f"Could not retrieve geolocation for "
+                            f"{location_warning_count} photo(s).\n"
+                            f"Latest issue: {latest_location_warning}",
+                        )
         except queue.Empty:
             pass
         root.after(100, poll_events)
@@ -215,16 +299,26 @@ def run_gui() -> None:
         row=0, column=1
     )
 
+    ttk.Label(root, text="Geocoding timeout (seconds):").grid(
+        row=1, column=0, padx=12, pady=(0, 8), sticky="w"
+    )
+    ttk.Spinbox(root, from_=1, to=3600, textvariable=timeout_var, width=8).grid(
+        row=1, column=0, padx=190, pady=(0, 8), sticky="w"
+    )
+
     ttk.Label(root, text="Currently processed file:").grid(
-        row=1, column=0, padx=12, sticky="w"
+        row=2, column=0, padx=12, sticky="w"
     )
     ttk.Entry(root, textvariable=current_file_var, state="readonly", width=64).grid(
-        row=2, column=0, padx=12, pady=(4, 10), sticky="ew"
+        row=3, column=0, padx=12, pady=(4, 10), sticky="ew"
+    )
+    ttk.Label(root, textvariable=warning_var, wraplength=440).grid(
+        row=4, column=0, padx=12, sticky="w"
     )
     progress = ttk.Progressbar(root, mode="determinate", length=440)
-    progress.grid(row=3, column=0, padx=12, sticky="ew")
+    progress.grid(row=5, column=0, padx=12, sticky="ew")
     start_button = ttk.Button(root, text="Start conversion", command=start_conversion)
-    start_button.grid(row=4, column=0, padx=12, pady=12, sticky="e")
+    start_button.grid(row=6, column=0, padx=12, pady=12, sticky="e")
 
     root.after(100, poll_events)
     root.mainloop()
@@ -237,12 +331,21 @@ def main() -> None:
         nargs="?",
         help="photo folder to process; omit to open the graphical interface",
     )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=20,
+        help="geocoding timeout in seconds (default: 20)",
+    )
     args = parser.parse_args()
+
+    if args.timeout < 1:
+        parser.error("--timeout must be at least 1 second")
 
     if args.directory:
         if not os.path.isdir(args.directory):
             parser.error(f"not an existing directory: {args.directory}")
-        rename_images(args.directory)
+        rename_images(args.directory, timeout=args.timeout)
     else:
         run_gui()
 
